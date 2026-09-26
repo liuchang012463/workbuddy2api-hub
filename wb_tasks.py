@@ -114,6 +114,7 @@ def fetch_growth_tasks(account):
                 prog = t.get("progress") or {}
                 tasks.append({
                     "task_code": code,
+                    "task_type": t.get("task_type") or "single",
                     "name": t.get("title") or spec.get("name") or code,
                     "description": t.get("description") or t.get("task_desc") or "",
                     "jump_url": t.get("jump_url") or "",
@@ -332,7 +333,7 @@ def build_event(account, kind, idx=0, expert=None):
                 "action": "apply", "source": "settings_close", "id": "theme-tkmw7j",
                 "vipLevel": "free", "series": "craft", "type": "unknown",
                 "name": "和平精英激战金秋", "userId": uid}
-    if kind in ("chat", "glmchat", "cat"):
+    if kind in ("chat", "glmchat", "cat", "buddy_first"):
         m_id = "glm-5.2" if kind in ("glmchat", "cat") else "deepseek-v4-flash"
         m_nm = "GLM-5.2" if kind in ("glmchat", "cat") else "DeepSeek V4 Flash"
         mode = "night" if kind == "cat" else "craft"
@@ -437,8 +438,29 @@ def run_growth_tasks(account, gap=1.0):
         logs.append("未能获取到任务清单，请检查网络或账号状态")
         return {"ok": False, "logs": logs, "earned_credit": 0}
 
+    # 0. 前置自动任务: 「领取一只 Buddy」(first_buddy) 为 auto 类型, 无需接取,
+    #    由对话行为点亮; 未完成时上游拒绝接取其它一切任务
+    #    (accept 返回 "prerequisite not met: first_buddy")。2026-09-26 实测。
+    fb = next((x for x in tasks if x["task_code"] == "first_buddy"), None)
+    if fb and fb["status"] == "not_accepted":
+        logs.append("检测到前置任务 [领取一只 Buddy] 未完成, 上报对话事件点亮...")
+        if report_events(account, [build_event(account, "buddy_first")]):
+            time.sleep(2.0)
+            tasks = fetch_growth_tasks(account)
+            fb = next((x for x in tasks if x["task_code"] == "first_buddy"), None)
+        else:
+            logs.append("! 前置任务对话事件上报失败, 其余任务接取可能被上游拦截")
+    # 关键: 前置任务必须"领奖"而不只是完成 —— 未领奖时上游同样拒绝接取其它任务。
+    if fb and fb.get("status") == "completed":
+        res_fb = claim_task(account, "first_buddy")
+        if res_fb.get("ok"):
+            logs.append(f"✓ 前置任务 [领取一只 Buddy] 点亮并领奖: +{res_fb.get('credit', 0)} 积分")
+            tasks = fetch_growth_tasks(account)
+        else:
+            logs.append(f"! 前置任务 [领取一只 Buddy] 领奖失败: {res_fb.get('msg') or '未知原因'}")
     # 1. 批量接取未接任务
-    unaccepted = [t["task_code"] for t in tasks if t["status"] == "not_accepted" and not t.get("unforgeable")]
+    unaccepted = [t["task_code"] for t in tasks if t["status"] == "not_accepted" and not t.get("unforgeable")
+                  and t.get("task_type") != "auto"]
     if unaccepted:
         logs.append(f"发现 {len(unaccepted)} 个待接取任务，正在批量接取...")
         acc = accept_tasks(account, unaccepted)
@@ -452,7 +474,7 @@ def run_growth_tasks(account, gap=1.0):
         tasks = fetch_growth_tasks(account)
         # 复核一次: 上游偶尔会瞬时拒绝整个批次, 复查后仍处于未接取的再补一次,
         # 否则后面所有上报都作用在未接取的任务上 —— 进度全是 0。
-        still = [t["task_code"] for t in tasks if t["status"] == "not_accepted"]
+        still = [t["task_code"] for t in tasks if t["status"] == "not_accepted" and t.get("task_type") != "auto"]
         if still:
             logs.append(f"仍有 {len(still)} 个未接取，重试接取一次...")
             retry = accept_tasks(account, still)
@@ -463,7 +485,7 @@ def run_growth_tasks(account, gap=1.0):
         if not tasks:
             logs.append("! 接取后无法获取任务清单，本轮中止")
             return {"ok": False, "logs": logs, "earned_credit": 0}
-        still_pending = [t["task_code"] for t in tasks if t["status"] == "not_accepted"]
+        still_pending = [t["task_code"] for t in tasks if t["status"] == "not_accepted" and t.get("task_type") != "auto"]
         if still_pending:
             logs.append(f"! 仍有 {len(still_pending)} 个任务处于未接取状态，"
                         f"对未接取任务上报事件不会计入进度，本轮跳过这些任务")
@@ -511,6 +533,10 @@ def run_growth_tasks(account, gap=1.0):
             continue
 
         if status == "not_accepted":
+            if t.get("task_type") == "auto":
+                # auto 任务无需接取, 靠行为点亮; 本次点亮未生效则下次运行重试。
+                logs.append(f"⏭ 任务 [{spec['name']}] 为自动任务且点亮未生效, 下次运行重试")
+                continue
             # 接取没成功就上报是白费功夫: 上游只对已接取的任务累计进度。
             logs.append(f"⏭ 任务 [{spec['name']}] 仍未接取, 跳过 (先解决接取失败)")
             continue
