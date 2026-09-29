@@ -39,6 +39,7 @@ import wb_accounts
 import wb_catalog
 import wb_http
 import wb_settings
+import wb_slothealth
 import wb_webtools
 import wb_identity
 IS_WINDOWS = os.name == "nt"
@@ -565,6 +566,18 @@ def _wb_observability_headers(account, attempts):
         if last.get("slot"):
             headers["X-WB-Slot"] = str(last["slot"])
     return headers
+
+
+def forward_reasoning_for(headers):
+    """是否向客戶端透傳 reasoning_content：請求頭優先，其次面板設置。
+
+    X-WB-Forward-Reasoning: true/false 覆蓋全局設置，方便個別客戶端按請求
+    選擇；其餘值按「要求透傳」處理。
+    """
+    raw = headers.get("X-WB-Forward-Reasoning") if headers is not None else None
+    if raw is not None:
+        return str(raw).strip().lower() not in ("false", "0", "off", "no")
+    return wb_settings.forward_reasoning(ACCOUNTS_DIR)
 
 
 def _pct(values, q):
@@ -1595,6 +1608,8 @@ def runtime_settings_view():
         "daily_token_limit": wb_settings.daily_token_limit(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "slot_fallback_url": wb_settings.slot_fallback_url(ACCOUNTS_DIR),
+        "forward_reasoning": wb_settings.forward_reasoning(ACCOUNTS_DIR),
+        "reasoning_effort_overrides": wb_settings.reasoning_effort_overrides(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
@@ -2312,8 +2327,13 @@ def strip_data_prefix(line):
     if not line or line.startswith(":"):
         return ""
     return line
-def clean_chunk(raw):
-    """Drop the empty noise fields the WorkBuddy gateway pads deltas with."""
+def clean_chunk(raw, strip_reasoning=False):
+    """Drop the empty noise fields the WorkBuddy gateway pads deltas with.
+
+    strip_reasoning=True 時把 reasoning_content 整個從流式增量裡剝掉（無論
+    是否為空），ttft_ms 從此嚴格等於客戶端看到的首個內容 chunk；默認保留
+    非空 reasoning 增量（歷史行為，DeepSeek 系客戶端靠它渲染思考過程）。
+    """
     try:
         obj = json.loads(raw)
     except Exception:
@@ -2338,6 +2358,9 @@ def clean_chunk(raw):
                 changed = True
         if isinstance(delta.get("tool_calls"), list) and not delta["tool_calls"]:
             delta.pop("tool_calls")
+            changed = True
+        if strip_reasoning and "reasoning_content" in delta:
+            delta.pop("reasoning_content")
             changed = True
         for key in NOISE_KEYS:
             if key in delta and not delta.get(key):
@@ -3068,11 +3091,25 @@ def build_upstream_body(payload):
             if "thinking" not in body:
                 body["thinking"] = {"type": "enabled"}
             if not effort:
-                body["reasoning_effort"] = model_default_effort(model) or "high"
+                body["reasoning_effort"] = resolve_default_effort(model)
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
     return body
+
+
+def resolve_default_effort(model):
+    """客戶端未指定 effort 時注入的默認力度：面板覆蓋表 → 目錄默認 → "high"。
+
+    覆蓋表（reasoning_effort_overrides）讀 settings，沿襲「每次讀文件即熱更」
+    的既有約定；一次請求只會在 build_upstream_body 裡走到這裡一兩次，開銷
+    可忽略。
+    """
+    overrides = wb_settings.reasoning_effort_overrides(ACCOUNTS_DIR) or {}
+    override = overrides.get(str(model or ""))
+    if override:
+        return override
+    return model_default_effort(model) or "high"
 
 
 def model_default_effort(model):
@@ -3401,7 +3438,7 @@ def open_upstream(payload, session_key=None, target_realm=None):
             t_pick = time.time()
             account = POOL.pick_for_session(realm=realm, session_key=session_key,
                                             exclude=tried, model=model,
-                                            exclude_slots=tried_slots) if POOL else None
+                                            exclude_slots=tried_slots | wb_slothealth.quarantined()) if POOL else None
             pick_ms = int((time.time() - t_pick) * 1000)
             if account is None:
                 if transient_hits and _attempt < max_attempts - 1:
@@ -3433,6 +3470,7 @@ def open_upstream(payload, session_key=None, target_realm=None):
             attempt_body = upstream_body
         attempt_data = json.dumps(attempt_body, ensure_ascii=False).encode("utf-8")
         chat_headers = account.headers(purpose="chat")
+        t_req = time.time()
         try:
             if wb_http.available():
                 # httpx 池：keep-alive 復用 TCP+TLS，首字延遲不再付握手開銷。
@@ -3451,11 +3489,15 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 req = urllib.request.Request(chat_url, data=attempt_data,
                                              method="POST", headers=chat_headers)
                 resp = wb_accounts.urlopen(req, timeout=600, proxy=proxy_used)
+            resp_ms = int((time.time() - t_req) * 1000)
+            att["resp_ms"] = resp_ms
             account.clear_error(model=model)
             reset_switch_counter(account, model)
             att["outcome"] = "ok"
             att["status"] = 200
             attempts.append(att)
+            if att["slot"] != "fallback":
+                wb_slothealth.record(att["slot"], True, resp_ms=resp_ms)
             try:
                 resp.attempts = attempts
             except Exception:
@@ -3524,10 +3566,14 @@ def open_upstream(payload, session_key=None, target_realm=None):
             if exc.code in (500, 502, 503, 504):
                 transient_hits += 1
                 att["outcome"] = "transient_5xx"
+                att["resp_ms"] = int((time.time() - t_req) * 1000)
                 attempts.append(att)
                 # 這個出口瞬態失敗：本輪請求不再考慮同出口的其他帳號，
                 # 並安排同帳號經備選出口補一刀。
                 tried_slots.add(account.proxy_slot or "direct")
+                if att["slot"] != "fallback":
+                    wb_slothealth.record(att["slot"], False,
+                                         resp_ms=att["resp_ms"], outcome="http_%d" % exc.code)
                 _schedule_fallback(account)
                 log("upstream %s for '%s', retrying" % (exc.code, model))
                 if session_key and POOL:
@@ -3544,8 +3590,12 @@ def open_upstream(payload, session_key=None, target_realm=None):
             if is_transient(exc):
                 transient_hits += 1
                 att["outcome"] = "transient"
+                att["resp_ms"] = int((time.time() - t_req) * 1000)
                 attempts.append(att)
                 tried_slots.add(account.proxy_slot or "direct")
+                if att["slot"] != "fallback":
+                    wb_slothealth.record(att["slot"], False,
+                                         resp_ms=att["resp_ms"], outcome="transient")
                 _schedule_fallback(account)
                 log("upstream connection hiccup for '%s' (%s), retrying"
                     % (model, type(exc).__name__))
@@ -6052,6 +6102,20 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_slot_fallback_url(ACCOUNTS_DIR, raw or "")
             reply["slot_fallback_url"] = wb_settings.slot_fallback_url(ACCOUNTS_DIR)
+        if "forward_reasoning" in payload:
+            raw = payload.get("forward_reasoning")
+            if not isinstance(raw, bool):
+                return self._error(400, "forward_reasoning must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_forward_reasoning(ACCOUNTS_DIR, raw)
+            reply["forward_reasoning"] = raw
+        if "reasoning_effort_overrides" in payload:
+            try:
+                cleaned = wb_settings.set_reasoning_effort_overrides(
+                    ACCOUNTS_DIR, payload.get("reasoning_effort_overrides"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["reasoning_effort_overrides"] = cleaned
         if "daily_chat_web" in payload:
             raw = payload.get("daily_chat_web")
             if not isinstance(raw, bool):
@@ -6088,7 +6152,18 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_proxy_slots(self, path, payload):
         """Proxy-slot management (panel-authenticated)."""
         if path == "/proxy/slots":
-            return self._json(200, {"slots": proxy_slots_view()})
+            return self._json(200, {"slots": proxy_slots_view(),
+                                    "health": wb_slothealth.snapshot()})
+        if path == "/proxy/slots/health":
+            # slot-cleanup.sh 巡檢結果回灌：{slots: [{slot|port, ok,
+            # latency_ms, upload_ms}]}。只記錄展示，禁用仍由腳本負責。
+            raw = payload.get("slots")
+            if not isinstance(raw, list):
+                return self._error(400, "slots must be a list", "invalid_request_error")
+            accepted = wb_slothealth.apply_report(raw)
+            log("slot health report: %d slot(s) accepted" % accepted)
+            return self._json(200, {"accepted": accepted,
+                                    "health": wb_slothealth.snapshot()})
         if path == "/proxy/slots/save":
             raw = payload.get("slots")
             if not isinstance(raw, list):
@@ -7047,6 +7122,8 @@ class Handler(BaseHTTPRequestHandler):
             last_usage = None
             first_ms = None
             ttfb_ms = None
+            # P4：reasoning 透傳與否在流開始前定死一次（設置熱更 + 每請求頭覆蓋）。
+            strip_reasoning = not forward_reasoning_for(self.headers)
             streamed_text = []
             try:
                 for line in upstream:
@@ -7072,7 +7149,7 @@ class Handler(BaseHTTPRequestHandler):
                                 streamed_text.append(delta["reasoning_content"])
                     except Exception:
                         pass
-                    cleaned = clean_chunk(data)
+                    cleaned = clean_chunk(data, strip_reasoning=strip_reasoning)
                     if not cleaned:
                         continue
                     if first_ms is None:

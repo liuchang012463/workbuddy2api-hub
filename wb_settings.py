@@ -437,6 +437,72 @@ def set_slot_fallback_url(accounts_dir, value):
         return data["slot_fallback_url"]
 
 
+VALID_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def forward_reasoning(accounts_dir):
+    """SSE 流是否把 reasoning_content 透传给客户端。
+
+    默认 True（与历史行为一致：clean_chunk 只剔除空 reasoning 增量）。
+    关闭后流式转发会主动剥离 reasoning_content，ttft_ms 严格等于客户端
+    看到的首个内容 chunk；非流式响应的 message.reasoning_content 不受影响
+    （多轮 backfill 依赖它）。客户端可用请求头 X-WB-Forward-Reasoning
+    按请求覆盖。
+    """
+    return load(accounts_dir).get("forward_reasoning") is not False
+
+
+def set_forward_reasoning(accounts_dir, enabled):
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["forward_reasoning"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def reasoning_effort_overrides(accounts_dir):
+    """按模型覆盖客户端未指定 effort 时注入的默认推理力度。
+
+    dict {完整模型名: effort}，值必须是 VALID_EFFORTS 之一（setter 已校验，
+    这里再兜底过滤一次，坏数据不致炸请求路径）。解析顺序：覆盖表 →
+    目录默认（model_default_effort）→ "high"。
+    """
+    raw = load(accounts_dir).get("reasoning_effort_overrides")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for model, effort in raw.items():
+        name = str(model or "").strip()
+        value = str(effort or "").strip().lower()
+        if name and value in VALID_EFFORTS:
+            out[name] = value
+    return out
+
+
+def set_reasoning_effort_overrides(accounts_dir, overrides):
+    """Persist the per-model effort overrides. Raises ValueError on bad input."""
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        raise ValueError("reasoning_effort_overrides must be an object")
+    cleaned = {}
+    for model, effort in overrides.items():
+        name = str(model or "").strip()
+        value = str(effort or "").strip().lower()
+        if not name:
+            continue
+        if value not in VALID_EFFORTS:
+            raise ValueError("invalid effort '%s' for model '%s' (allowed: %s)"
+                             % (value, name, ", ".join(VALID_EFFORTS)))
+        cleaned[name] = value
+    with _lock:
+        data = load(accounts_dir)
+        data["reasoning_effort_overrides"] = cleaned
+        save(accounts_dir, data)
+    return cleaned
+
+
 def daily_chat_web(accounts_dir):
     """Whether the intl daily check-in also opens a web-channel conversation.
 

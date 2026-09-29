@@ -817,6 +817,39 @@ a:hover{text-decoration:underline}
       <section>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
           <div>
+            <h2 style="margin:0">推理内容透传 <em id="setForwardReasoningState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              流式响应是否把 reasoning_content（思考过程增量）转发给客户端。默认透传（DeepSeek 系客户端靠它渲染思考）；关闭后网关剥离思考增量，客户端只看到正文，ttft 严格等于首个正文 chunk。非流式响应的 message.reasoning_content 不受影响。客户端也可用请求头 X-WB-Forward-Reasoning: true/false 按请求覆盖。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setForwardReasoning" type="checkbox" style="width:16px;height:16px">
+              透传思考过程
+            </label>
+            <button onclick="saveForwardReasoning(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">默认推理力度覆盖 <em id="setEffortOverridesState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              客户端没传 reasoning_effort 时，DeepSeek 系模型会按「模型目录默认 → high」注入。这里可以按模型名覆盖，例如 {"deepseek-v4.1-flash": "medium"}（合法值：minimal / low / medium / high）。客户端显式传了 effort 时永远以客户端为准。留空 {} 恢复目录默认。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <input id="setEffortOverrides" type="text" class="mono" placeholder='{"deepseek-v4.1-flash": "medium"}' style="min-width:280px">
+            <button onclick="saveEffortOverrides(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
             <h2 style="margin:0">国际版每日活跃打卡 <em id="setDailyChatWebState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话（在 console/as 下建一个带 prompt 的会话）。实测只有网页端对话会被计入官方「每日活跃」，桌面身分的对话不计入。默认开启。
@@ -2660,6 +2693,26 @@ async function loadSettings(showToast){
         localWebState.textContent = localWeb ? '(已启用)' : '(直通)';
         localWebState.style.color = localWeb ? 'var(--accent2)' : 'var(--dim)';
       }
+      const fwdReasoning = data.forward_reasoning !== false;
+      const fwdReasoningInput = document.getElementById('setForwardReasoning');
+      if(fwdReasoningInput) fwdReasoningInput.checked = fwdReasoning;
+      const fwdReasoningState = document.getElementById('setForwardReasoningState');
+      if(fwdReasoningState){
+        fwdReasoningState.textContent = fwdReasoning ? '(透传)' : '(剥离)';
+        fwdReasoningState.style.color = fwdReasoning ? 'var(--accent2)' : 'var(--warn)';
+      }
+      const effortOverrides = data.reasoning_effort_overrides || {};
+      const effortOverridesInput = document.getElementById('setEffortOverrides');
+      if(effortOverridesInput && document.activeElement !== effortOverridesInput){
+        effortOverridesInput.value = Object.keys(effortOverrides).length
+          ? JSON.stringify(effortOverrides) : '';
+      }
+      const effortOverridesState = document.getElementById('setEffortOverridesState');
+      if(effortOverridesState){
+        effortOverridesState.textContent = Object.keys(effortOverrides).length
+          ? '(' + Object.keys(effortOverrides).length + ' 个覆盖)' : '(目录默认)';
+        effortOverridesState.style.color = Object.keys(effortOverrides).length ? 'var(--accent2)' : 'var(--dim)';
+      }
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
     API_KEY_ROWS = (data.api_keys || []).map(k => ({
@@ -2737,6 +2790,44 @@ async function saveDailyTokenLimit(btn){
   try {
     await postJSON('/settings/save', {daily_token_limit: value});
     toast(value > 0 ? ('已启用：账号当日超过 ' + fmt(value) + ' token 后暂停接单') : '已设为不限（0 = 不限额）', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveForwardReasoning(btn){
+  const el = document.getElementById('setForwardReasoning');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {forward_reasoning: value});
+    toast(value ? '已透传推理内容' : '已剥离推理内容（ttft 只算正文）', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveEffortOverrides(btn){
+  const el = document.getElementById('setEffortOverrides');
+  const raw = (el && el.value || '').trim();
+  let parsed = {};
+  if(raw){
+    try { parsed = JSON.parse(raw); }
+    catch(e){ toast('格式错误：需要 JSON 对象，如 {"deepseek-v4.1-flash": "medium"}', 'bad'); return; }
+    if(!parsed || typeof parsed !== 'object' || Array.isArray(parsed)){
+      toast('格式错误：需要 JSON 对象，如 {"deepseek-v4.1-flash": "medium"}', 'bad'); return;
+    }
+  }
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {reasoning_effort_overrides: parsed});
+    toast('默认推理力度覆盖已保存', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
@@ -3089,6 +3180,9 @@ async function saveApiKeys(btn){
 }
 
 let PROXY_SLOTS = [];
+/* 運行時槽位健康（wb_slothealth 快照 + slot-cleanup 巡檢報告），/proxy/slots
+ * 響應裡的 health 欄位，key 為 slot id。 */
+let SLOT_HEALTH = {};
 /* 编辑器里有未保存改动时为 true（issue #79）。
  *
  * 刷新槽位是「拉服务端列表 → 整体替换 → 重绘整张表」，而「+ 添加槽位」只是把
@@ -3113,7 +3207,8 @@ function slotSelectHtml(a){
   }
   opts.push.apply(opts, PROXY_SLOTS.map(s =>
     '<option value="' + esc(s.id) + '"' + (s.id === current ? ' selected' : '') + '>'
-    + esc(s.name || s.id) + (s.enabled === false ? '（停用）' : '') + '</option>'));
+    + esc(s.name || s.id) + (s.enabled === false ? '（停用）' : '')
+    + (SLOT_HEALTH[s.id] && SLOT_HEALTH[s.id].quarantined ? '（隔离）' : '') + '</option>'));
   const uidAttr = esc(String(a.uid || '').replace(/[^\w.@-]/g, ''));
   return '<select class="slot-select" onchange="setAccountSlot(&quot;' + uidAttr + '&quot;, this.value, this)">'
     + opts.join('') + '</select>';
@@ -3140,6 +3235,7 @@ async function loadProxySlots(force){
   try{
     const r = await getJSON('/proxy/slots');
     PROXY_SLOTS = r.slots || [];
+    SLOT_HEALTH = r.health || {};
     renderProxySlots();
   }catch(e){
     // Panel not logged in yet; actions on the settings page surface errors.
@@ -3164,6 +3260,26 @@ function markSlotsDirty(){
   renderSlotState();
 }
 
+/* 槽位健康徽章：運行時 EWMA / 隔離狀態 / slot-cleanup 巡檢報告。 */
+function slotHealthBadge(id){
+  const h = SLOT_HEALTH[id];
+  if(!h) return '<span style="color:var(--dim)">—</span>';
+  const bits = [];
+  if(h.quarantined) bits.push('<b style="color:var(--warn)">隔离 ' + (h.quarantined_for || 0) + 's</b>');
+  if(h.ewma_ms != null) bits.push('运行 ' + h.ewma_ms + 'ms ×' + (h.samples || 0));
+  if(h.reported){
+    const rp = h.reported;
+    const lat = (rp.latency_ms != null ? rp.latency_ms + 'ms' : '');
+    const up = (rp.upload_ms != null && rp.upload_ms > 0 ? ' · 传' + rp.upload_ms + 'ms' : '');
+    bits.push(rp.ok
+      ? '<span style="color:var(--dim)">巡检 ' + esc(lat + up) + '</span>'
+      : '<b style="color:var(--warn)">巡检失败</b>');
+  } else if(h.error_count > 0 && !h.quarantined){
+    bits.push('<span style="color:var(--dim)">错 ' + h.error_count + '</span>');
+  }
+  return bits.length ? bits.join('<br>') : '<span style="color:var(--dim)">—</span>';
+}
+
 function renderProxySlots(){
   const box = document.getElementById('slotList');
   if(!box) return;
@@ -3177,6 +3293,7 @@ function renderProxySlots(){
     + '<th>代理地址</th>'
     + '<th style="width:90px;text-align:center">启用</th>'
     + '<th style="width:90px;text-align:center">绑定账号</th>'
+    + '<th style="width:150px;text-align:center">健康</th>'
     + '<th style="width:190px;text-align:center">操作</th>'
     + '</tr></thead><tbody>'
     + PROXY_SLOTS.map((s, i) =>
@@ -3186,13 +3303,14 @@ function renderProxySlots(){
         + '<td style="text-align:center" data-label="启用"><input type="checkbox" ' + (s.enabled === false ? '' : 'checked')
         +   ' onchange="PROXY_SLOTS[' + i + '].enabled=this.checked; markSlotsDirty()"></td>'
         + '<td style="text-align:center" data-label="绑定账号">' + (s.bound || 0) + '</td>'
+        + '<td style="text-align:center;font-size:12px" data-label="健康">' + slotHealthBadge(s.id) + '</td>'
         + '<td style="text-align:center;white-space:nowrap" data-label="">'
         +   '<button class="sec mini" onclick="testProxySlot(' + i + ', this)">测试</button> '
         +   '<button class="danger mini" onclick="removeProxySlot(' + i + ')">删除</button>'
         + '</td></tr>'
       ).join('')
     + '</tbody></table></div>'
-    + '<div class="legend"><span>「绑定账号」只统计已启用账号；停用账号会自动释放槽位，重新启用后需重新绑定。在网关页账号表的「出口」下拉中调整绑定。</span></div>';
+    + '<div class="legend"><span>「绑定账号」只统计已启用账号；停用账号会自动释放槽位，重新启用后需重新绑定。在网关页账号表的「出口」下拉中调整绑定。「健康」列：运行延迟为网关真实流量的 EWMA；巡检数据来自 slot-cleanup 定时任务回灌；连续瞬态失败会隔离出口（到期自动半开恢复）。</span></div>';
 }
 
 function addProxySlotRow(){
