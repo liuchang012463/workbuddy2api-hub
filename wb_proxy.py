@@ -5640,7 +5640,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(
                     401, "panel password required", "invalid_request_error"
                 )
-            return self._json(200, {"slots": proxy_slots_view()})
+            return self._json(200, {"slots": proxy_slots_view(),
+                                    "health": wb_slothealth.snapshot()})
         if path == "/logs":
             return self._get_logs(query)
         if path == "/logs/export":
