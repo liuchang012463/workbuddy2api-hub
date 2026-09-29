@@ -383,7 +383,8 @@ def row_outcome(row):
         return o
     return "failed" if row.get("error") else "completed"
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
-                account=None, outcome="completed"):
+                account=None, outcome="completed", ttfb_ms=None, attempts=None,
+                refresh_ms=None, slot=None):
     """Record one finished request as exactly one JSONL row.
 
     A request without a usage block still gets a row (flagged usage_missing):
@@ -413,6 +414,17 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row.update(fp)
     if account:
         row["account"] = account
+        # ttft_ms 上報的是第一個可見 chunk；reasoning 模型的推理 chunk 會被
+        # clean_chunk 吃掉，所以同時記 ttfb_ms（上游第一個字節）把「上游排隊」
+        # 和「推理時間」拆開，否則 p50=31s 的 ttft 無法歸因。
+        if ttfb_ms is not None:
+            row["ttfb_ms"] = int(ttfb_ms)
+        if attempts is not None:
+            row["attempts"] = int(attempts)
+        if refresh_ms is not None:
+            row["refresh_ms"] = int(refresh_ms)
+        acc_row = POOL.get(account) if POOL else None
+        row["slot"] = str(slot or (acc_row.proxy_slot if acc_row else "") or "direct")
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
     # Derived per-request rates (None-safe).
@@ -473,7 +485,8 @@ def _persist_usage(row, fail_label):
 
 def record_error(model, status, message, elapsed_ms=None, account=None,
                  usage=None, stream=None, ttft_ms=None, gen_ms=None, fp=None,
-                 outcome="failed"):
+                 outcome="failed", ttfb_ms=None, attempts=None, refresh_ms=None,
+                 slot=None):
     """Record one failed request as exactly one JSONL row.
 
     Passing the account uid records which account the request was bound to, so
@@ -503,8 +516,14 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
         row["stream"] = bool(stream)
     if ttft_ms is not None:
         row["ttft_ms"] = ttft_ms
+    if ttfb_ms is not None:
+        row["ttfb_ms"] = int(ttfb_ms)
     if gen_ms is not None:
         row["gen_ms"] = gen_ms
+    if attempts is not None:
+        row["attempts"] = int(attempts)
+    if refresh_ms is not None:
+        row["refresh_ms"] = int(refresh_ms)
     row.update(fields)
     if fp:
         row.update(fp)
@@ -512,6 +531,7 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
         row["account"] = account
         acc = POOL.get(account) if POOL else None
         row["realm"] = acc.realm if acc else CURRENT_REALM
+        row["slot"] = str(slot or (acc.proxy_slot if acc else "") or "direct")
     with _lock:
         _usage["errors"] += 1
         if elapsed_ms is not None:
@@ -521,6 +541,31 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
     log(f"request error: model={model}{dur} status={status} msg={str(message)[:180]}", level="ERROR", tag="chat")
     return row
+def _attempts_meta(attempts):
+    """Fold the open_upstream attempt list into (count, refresh_ms, slot).
+
+    refresh_ms 取各輪刷新耗時的最大值（pick 期間真正發生過的同步刷新才非
+    None）；slot 取最後一輪（真正服務請求的那一輪）的出口。
+    """
+    if not attempts:
+        return None, None, None
+    refresh_vals = [a.get("refresh_ms") for a in attempts
+                    if isinstance(a, dict) and a.get("refresh_ms") is not None]
+    last = attempts[-1] if isinstance(attempts[-1], dict) else {}
+    return len(attempts), (max(refresh_vals) if refresh_vals else None), last.get("slot")
+
+
+def _wb_observability_headers(account, attempts):
+    """X-WB-Slot / X-WB-Attempts：讓客戶端也能看到出口與重試次數。"""
+    headers = {"X-WB-Slot": str(getattr(account, "proxy_slot", None) or "direct")}
+    if attempts:
+        headers["X-WB-Attempts"] = str(len(attempts))
+        last = attempts[-1] if isinstance(attempts[-1], dict) else {}
+        if last.get("slot"):
+            headers["X-WB-Slot"] = str(last["slot"])
+    return headers
+
+
 def _pct(values, q):
     """Nearest-rank percentile (no interpolation) - good enough for latency."""
     if not values:
@@ -1548,6 +1593,7 @@ def runtime_settings_view():
         "reserve_credits": wb_settings.reserve_credits(ACCOUNTS_DIR),
         "daily_token_limit": wb_settings.daily_token_limit(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
+        "slot_fallback_url": wb_settings.slot_fallback_url(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
@@ -3307,30 +3353,71 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 % (session_key, len(upstream_body.get("messages") or [])))
     total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
     tried = set()
+    # 槽位感知重試：某個出口瞬態失敗後，本輪請求不再把綁在同一出口上的帳號
+    # 派出去（慢出口會放大整包重發的代價，見 slot-cleanup 的 500KB 測速）。
+    # 池子打空時 pick 會整體放開這個限制。
+    tried_slots = set()
+    # 備選出口：瞬態失敗後允許同一帳號經 slot_fallback_url（默認 DIRECT）再試
+    # 一次。None 表示關閉。只對網路抖動/5xx 生效：429 是配額問題，換出口無解。
+    fallback_url = wb_settings.slot_fallback_url(ACCOUNTS_DIR)
+    fallback_used = False
+    retry_same = None
+    # P1 觀測：每次嘗試記一條 {uid, slot, outcome, status, pick_ms, refresh_ms}。
+    # 成功時整個列表掛在響應對象上（resp.attempts），失敗時掛在異常上
+    # （exc.attempts），調用方不必改簽名就能取到。
+    attempts = []
     last_error = None
     last_uid = None
     last_429 = None
     last_429_detail = ""
     last_403_detail = ""
     transient_hits = 0
+
+    def _schedule_fallback(acct):
+        nonlocal fallback_used, retry_same
+        if fallback_url is None or fallback_used:
+            return
+        if (acct.proxy or "") == (fallback_url or ""):
+            return
+        fallback_used = True
+        retry_same = (acct, fallback_url)
+
     # Read once per request, not per attempt: this is a panel setting, and a
     # settings read on every retry would be pure overhead.
     auto_switch = auto_switch_product_enabled()
-    max_attempts = max(2, total) + 1 + (MAX_PRODUCT_SWITCHES if auto_switch else 0)
+    # +1 給備選出口那一輪留位：retry_same 不走 pick，但要佔一次循環。
+    max_attempts = max(2, total) + 1 + (MAX_PRODUCT_SWITCHES if auto_switch else 0) + 1
     for _attempt in range(max_attempts):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
-        if account is None:
-            if transient_hits and _attempt < max_attempts - 1:
-                tried.clear()
-                time.sleep(min(1.5 * transient_hits, 3.0))
+        pick_ms = 0
+        if retry_same is not None:
+            # 同帳號備選出口重試：不走 pick（tried 裡已經有它的 uid）。
+            account, proxy_used = retry_same
+            retry_same = None
+        else:
+            t_pick = time.time()
+            account = POOL.pick_for_session(realm=realm, session_key=session_key,
+                                            exclude=tried, model=model,
+                                            exclude_slots=tried_slots) if POOL else None
+            pick_ms = int((time.time() - t_pick) * 1000)
+            if account is None:
+                if transient_hits and _attempt < max_attempts - 1:
+                    tried.clear()
+                    tried_slots.clear()
+                    time.sleep(min(1.5 * transient_hits, 3.0))
+                    continue
+                break
+            if account.realm != realm:
+                if session_key and POOL: POOL.affinity.unbind(session_key)
                 continue
-            break
-        if account.realm != realm:
-            if session_key and POOL: POOL.affinity.unbind(session_key)
-            continue
-        tried.add(account.uid)
+            tried.add(account.uid)
+            proxy_used = account.proxy
         last_uid = account.uid
+        att = {"uid": account.uid,
+               "slot": "fallback" if proxy_used != account.proxy
+                       else (account.proxy_slot or "direct"),
+               "pick_ms": pick_ms,
+               "refresh_ms": getattr(account, "last_refresh_ms", None),
+               "status": None, "outcome": None}
         cfg = wb_accounts.get_realm_config(account.realm)
         chat_url = account.chat_base_url() + CHAT_PATH
         # The cache key is account scoped, so it is rebuilt per candidate rather
@@ -3344,11 +3431,19 @@ def open_upstream(payload, session_key=None, target_realm=None):
         req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
                                      headers=account.headers(purpose="chat"))
         try:
-            resp = wb_accounts.urlopen(req, timeout=600, proxy=account.proxy)
+            resp = wb_accounts.urlopen(req, timeout=600, proxy=proxy_used)
             account.clear_error(model=model)
             reset_switch_counter(account, model)
+            att["outcome"] = "ok"
+            att["status"] = 200
+            attempts.append(att)
+            try:
+                resp.attempts = attempts
+            except Exception:
+                pass
             return resp, account
         except urllib.error.HTTPError as exc:
+            att["status"] = exc.code
             if exc.code == 429:
                 try:
                     detail = exc.read(600).decode("utf-8", "replace")
@@ -3358,8 +3453,12 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
                 # Model-scoped: only this model is throttled for this account,
                 # so sibling models stay serviceable on the same credential.
-                account.note_error("HTTP 429 (model throttled)", model=model, until=reset_at,
-                                   cooldown=wait)
+                # note_rate_limit 額外維護 429 連擊計數：連續 429 時把帳號級
+                # 冷卻遞進到 300s/900s（單帳號池除外），見 Account.note_rate_limit。
+                account.note_rate_limit("HTTP 429 (model throttled)", model=model, until=reset_at,
+                                        cooldown=wait, single_account=(total <= 1))
+                att["outcome"] = "rate_limited"
+                attempts.append(att)
                 if auto_switch and _try_switch_product(account, model):
                     # 換了身分就等於換了一條配額線：要把它從「已試過」拿掉，
                     # 並清掉剛剛記下的模型冷卻，否則下一輪迴圈會找不到帳號。
@@ -3385,6 +3484,8 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 except Exception:
                     detail = ""
                 log("upstream 403 for '%s' (content review), passing through" % model)
+                att["outcome"] = "content_rejected"
+                attempts.append(att)
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 last_error = exc
@@ -3392,6 +3493,8 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 break
             if exc.code == 401:
                 log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
+                att["outcome"] = "auth_rejected"
+                attempts.append(att)
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 account.note_error("HTTP 401",
@@ -3401,22 +3504,37 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 continue
             if exc.code in (500, 502, 503, 504):
                 transient_hits += 1
+                att["outcome"] = "transient_5xx"
+                attempts.append(att)
+                # 這個出口瞬態失敗：本輪請求不再考慮同出口的其他帳號，
+                # 並安排同帳號經備選出口補一刀。
+                tried_slots.add(account.proxy_slot or "direct")
+                _schedule_fallback(account)
                 log("upstream %s for '%s', retrying" % (exc.code, model))
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 last_error = exc
                 continue
+            att["outcome"] = "http_%s" % exc.code
+            attempts.append(att)
+            exc.attempts = attempts
             raise
         except Exception as exc:
             if session_key and POOL:
                 POOL.affinity.unbind(session_key)
             if is_transient(exc):
                 transient_hits += 1
+                att["outcome"] = "transient"
+                attempts.append(att)
+                tried_slots.add(account.proxy_slot or "direct")
+                _schedule_fallback(account)
                 log("upstream connection hiccup for '%s' (%s), retrying"
                     % (model, type(exc).__name__))
                 last_error = exc
                 time.sleep(min(0.6 * transient_hits, 2.0))
                 continue
+            att["outcome"] = "account_error"
+            attempts.append(att)
             account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1))
             last_error = exc
             continue
@@ -3428,14 +3546,20 @@ def open_upstream(payload, session_key=None, target_realm=None):
             last_error.account_uid = last_uid
         except Exception:
             pass
+        try:
+            last_error.attempts = attempts
+        except Exception:
+            pass
         if last_429 is not None:
             exc = RateLimited(last_429, last_429_detail,
                               wait=retry_after_seconds(model, realm))
             exc.account_uid = last_uid
+            exc.attempts = attempts
             raise exc
         if last_403_detail:
             exc = ContentRejected(last_error, last_403_detail)
             exc.account_uid = last_uid
+            exc.attempts = attempts
             raise exc
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
@@ -5043,6 +5167,9 @@ class Handler(BaseHTTPRequestHandler):
         # request line is rejected before it), so fall back to "".
         if cors_origin_allowed(getattr(self, "path", "") or ""):
             self.send_header("Access-Control-Allow-Origin", "*")
+        # 非流式路徑的出口觀測頭（_wb_extra_headers 由調用方先塞好）。
+        for _hk, _hv in (getattr(self, "_wb_extra_headers", None) or {}).items():
+            self.send_header(_hk, _hv)
         self.end_headers()
         self.wfile.write(body)
         # Flush here rather than relying on the caller: with HTTP/1.1
@@ -5898,6 +6025,14 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_auto_switch_product(ACCOUNTS_DIR, raw)
             reply["auto_switch_product"] = raw
+        if "slot_fallback_url" in payload:
+            # 字符串三態："" = DIRECT 備選、"off" = 關閉、URL = 指定代理。
+            raw = payload.get("slot_fallback_url")
+            if raw is not None and not isinstance(raw, str):
+                return self._error(400, "slot_fallback_url must be a string",
+                                   "invalid_request_error")
+            wb_settings.set_slot_fallback_url(ACCOUNTS_DIR, raw or "")
+            reply["slot_fallback_url"] = wb_settings.slot_fallback_url(ACCOUNTS_DIR)
         if "daily_chat_web" in payload:
             raw = payload.get("daily_chat_web")
             if not isinstance(raw, bool):
@@ -6562,28 +6697,33 @@ class Handler(BaseHTTPRequestHandler):
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
             upstream, account = open_upstream(chat_req, session_key=session_key, target_realm=req_realm)
+            attempts = getattr(upstream, "attempts", None)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             return self._error(403, "upstream 403: %s" % (exc.detail or "content rejected"),
                                "invalid_request_error")
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200], elapsed_ms=int(t * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             if message.startswith("no usable account"):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
@@ -6592,18 +6732,20 @@ class Handler(BaseHTTPRequestHandler):
             if want_stream:
                 return self._responses_stream_response(
                     upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
-                    base_body=chat_req, session_key=session_key, realm=req_realm)
+                    base_body=chat_req, session_key=session_key, realm=req_realm, attempts=attempts)
             return self._responses_nonstream_response(
                 upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
-                base_body=chat_req, session_key=session_key, realm=req_realm)
+                base_body=chat_req, session_key=session_key, realm=req_realm, attempts=attempts)
 
-    def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None):
+    def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, attempts=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
+        for _hk, _hv in _wb_observability_headers(account, attempts).items():
+            self.send_header(_hk, _hv)
         self.end_headers()
         holder = {"usage": None, "custom_names": custom_names,
                   "request_meta": request_meta,
@@ -6641,24 +6783,29 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 upstream, account = follow_up_with_tool_results(
                     internal, holder, model, session_key, t_start, drop_tools=give_up)
+                attempts = getattr(upstream, "attempts", attempts)
             if total_usage:
                 holder["usage"] = total_usage
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             wall = int((time.time() - t_start) * 1000)
+            _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
             record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
-                         ttft_ms=first_ms,
+                         ttft_ms=first_ms, ttfb_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
                          fp=fp, account=account.uid,
-                         outcome="client_aborted")
+                         outcome="client_aborted",
+                         attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
             return
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
+            _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
             record_error(model, 502, "stream aborted: %s" % exc,
                          elapsed_ms=wall, account=account.uid,
                          usage=holder.get("usage"), stream=True,
-                         ttft_ms=first_ms,
+                         ttft_ms=first_ms, ttfb_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="upstream_aborted")
+                         fp=fp, outcome="upstream_aborted",
+                         attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
             try:
                 self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
                 self.wfile.flush()
@@ -6673,17 +6820,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         wall = int((time.time() - t_start) * 1000)
+        _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
         record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
-                     ttft_ms=first_ms,
+                     ttft_ms=first_ms, ttfb_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid)
+                     fp=fp, account=account.uid,
+                     attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
         return
 
-    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None):
+    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, attempts=None):
         # 跟串流那條一樣：客戶端宣告 web_search / web_fetch 時由反代代跑。
         # 中間那幾輪對客戶端不可見，最後才組成一個 Responses 物件回傳；不這樣
         # 做的話 web_search 的 function_call 會直接漏給客戶端，客戶端只會回
         # 一句 unsupported call。
+        self._wb_extra_headers = _wb_observability_headers(account, attempts)
         sources = []
         rounds = 0
         # 開關關閉時不攔同名呼叫：那是客戶端自己的工具。
@@ -6711,6 +6861,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 upstream, account = follow_up_with_tool_results(
                     calls, holder, model, session_key, t_start, drop_tools=give_up)
+                attempts = getattr(upstream, "attempts", attempts)
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -6718,10 +6869,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(502, "web tool follow-up failed: %s" % exc)
             sources = holder.get("web_sources") or sources
         wall = int((time.time() - t_start) * 1000)
+        first_at = chat_obj.get("first_chunk_at")
+        first_ms = int((first_at - t_start) * 1000) if first_at else None
+        _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
         result = chat_to_response(chat_obj, model, custom_names, request_meta, namespace_map,
                                   sources=sources)
         record_usage(model, chat_obj.get("usage"), stream=False, elapsed_ms=wall, fp=fp,
-                     account=account.uid)
+                     account=account.uid, ttft_ms=first_ms, ttfb_ms=first_ms,
+                     gen_ms=(wall - first_ms) if first_ms is not None else None,
+                     attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
         return self._json(200, result)
 
     def do_POST(self):
@@ -6819,27 +6975,32 @@ class Handler(BaseHTTPRequestHandler):
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
             upstream, account = open_upstream(payload, session_key=session_key, target_realm=req_realm)
+            attempts = getattr(upstream, "attempts", None)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             return self._error(403, "upstream 403: %s" % (exc.detail or "content rejected"),
                                "invalid_request_error")
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None))
+                         account=getattr(exc, "account_uid", None),
+                         attempts=getattr(exc, "attempts", None))
             if message.startswith("no usable account"):
                 # Only a genuinely empty/cooling pool is a 503. A throttled model
                 # is reported as 429 by _rate_limited above instead.
@@ -6849,24 +7010,32 @@ class Handler(BaseHTTPRequestHandler):
         with upstream:
             if want_stream:
                 return self._chat_stream_response(
-                    upstream, model, fp, account, t_start)
+                    upstream, model, fp, account, t_start, attempts=attempts)
             return self._chat_nonstream_response(
-                upstream, model, fp, account, t_start)
+                upstream, model, fp, account, t_start, attempts=attempts)
 
-    def _chat_stream_response(self, upstream, model, fp, account, t_start):
+    def _chat_stream_response(self, upstream, model, fp, account, t_start, attempts=None):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             if cors_origin_allowed(self.path):
                 self.send_header("Access-Control-Allow-Origin", "*")
+            for _hk, _hv in _wb_observability_headers(account, attempts).items():
+                self.send_header(_hk, _hv)
             self.end_headers()
             emitted = False
             last_usage = None
             first_ms = None
+            ttfb_ms = None
             streamed_text = []
             try:
                 for line in upstream:
+                    if ttfb_ms is None:
+                        # 上游第一個字節（含 reasoning chunk）：ttft_ms 只算
+                        # 第一個可見 chunk，兩者之差就是被 clean_chunk 吃掉的
+                        # 推理時間。
+                        ttfb_ms = int((time.time() - t_start) * 1000)
                     data = strip_data_prefix(line.decode("utf-8", "replace"))
                     if not data or data == "[DONE]" or data.startswith(":"):
                         continue
@@ -6895,22 +7064,26 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client hung up; still account for what upstream produced.
                 wall = int((time.time() - t_start) * 1000)
+                _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
                 record_usage(model, last_usage, stream=True,
-                             elapsed_ms=wall, ttft_ms=first_ms,
+                             elapsed_ms=wall, ttft_ms=first_ms, ttfb_ms=ttfb_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, account=account.uid,
-                             outcome="client_aborted")
+                             fp=fp, account=account.uid, outcome="client_aborted",
+                             attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
                 return
             except Exception as exc:
                 # Upstream quit mid-stream (timeout, incomplete read, ...).
                 # The client would otherwise get a truncated stream with no
                 # terminal marker, and the traceback reached the HTTP layer.
                 wall = int((time.time() - t_start) * 1000)
+                _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
                 record_error(model, 502, "stream aborted: %s" % exc,
                              elapsed_ms=wall, account=account.uid,
-                            usage=last_usage, stream=True, ttft_ms=first_ms,
-                            gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, outcome="upstream_aborted")
+                             usage=last_usage, stream=True, ttft_ms=first_ms,
+                             ttfb_ms=ttfb_ms,
+                             gen_ms=(wall - first_ms) if first_ms is not None else None,
+                             fp=fp, outcome="upstream_aborted",
+                             attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
                 try:
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
@@ -6934,27 +7107,36 @@ class Handler(BaseHTTPRequestHandler):
                         "completion_tokens_details": {"reasoning_tokens": 0},
                         "prompt_tokens_details": {"cached_tokens": 0},
                     }
+            _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
             record_usage(model, last_usage, stream=True,
-                         elapsed_ms=wall, ttft_ms=first_ms,
+                         elapsed_ms=wall, ttft_ms=first_ms, ttfb_ms=ttfb_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid)
+                         fp=fp, account=account.uid,
+                         attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
             return
 
-    def _chat_nonstream_response(self, upstream, model, fp, account, t_start):
+    def _chat_nonstream_response(self, upstream, model, fp, account, t_start, attempts=None):
+        # 非流式走 _json() 發頭，觀測頭先掛在實例上。
+        self._wb_extra_headers = _wb_observability_headers(account, attempts)
         try:
             result = aggregate_stream(upstream, model, None)
         except Exception as exc:
             record_error(model, 502, str(exc), elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=account.uid)
+                         account=account.uid,
+                         attempts=(len(attempts) if attempts else None))
             return self._error(502, f"upstream stream error: {exc}")
         wall = int((time.time() - t_start) * 1000)
         first_at = result.get("first_chunk_at")
         # Measured from request arrival so streaming and non-streaming are comparable.
         first_ms = int((first_at - t_start) * 1000) if first_at else None
+        # aggregate_stream 不清洗 chunk，first_chunk_at 就是第一個數據幀，
+        # 語義上等同流式路徑的 ttfb_ms，兩個都記保持口徑一致。
+        _att_count, _att_refresh, _att_slot = _attempts_meta(attempts)
         record_usage(model, result.get("usage"), stream=False,
-                     elapsed_ms=wall, ttft_ms=first_ms,
+                     elapsed_ms=wall, ttft_ms=first_ms, ttfb_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid)
+                     fp=fp, account=account.uid,
+                     attempts=_att_count, refresh_ms=_att_refresh, slot=_att_slot)
         return self._json(200, result)
 
 def main():

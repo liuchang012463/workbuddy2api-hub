@@ -233,6 +233,12 @@ class Account(object):
         self.enabled = data.get("enabled", True)
         self.last_error = str(data.get("lastError") or "")
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
+        # 429 連擊計數：連續 429 時帳號級冷卻按 note_rate_limit 的檔位遞進，
+        # 成功一次就清零。隨檔案持久化，重啟不會忘記一個正在被上游打壓的帳號。
+        self.rate_streak = int(data.get("rateStreak") or 0)
+        # 最近一次同步 refresh 的耗時（ready() 裡測量，runtime-only）。
+        # open_upstream 把它隨 attempts 上報，用來解釋 TTFT 裡的刷新開銷。
+        self.last_refresh_ms = None
         # Per-model throttling. Upstream rate limits (code 6004 "usage exceeds
         # frequency limit") apply to ONE model for one account, not to the whole
         # account: other models keep working. Cooldown the offending model only,
@@ -287,6 +293,7 @@ class Account(object):
             "enabled": self.enabled,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
+            "rateStreak": self.rate_streak,
             "credits": self.credits,
             "lastCheckin": self.last_checkin,
             "lastDailyChat": self.last_daily_chat,
@@ -420,6 +427,7 @@ class Account(object):
             return False
 
     def ready(self, model=None):
+        self.last_refresh_ms = None
         if not self.enabled or not self.access_token:
             return False
         if self.throttle_wait(model=model) > 0:
@@ -438,13 +446,17 @@ class Account(object):
         remaining = exp - time.time()
         if remaining > 120:
             return True
-        if remaining > 0:
-            # Refresh is a last resort and its result decides availability.
-            # Returning True unconditionally here kept handing out an account
-            # whose token was about to expire, so requests went upstream with a
-            # stale credential and came back 401/403.
-            return self.refresh()
-        return self.refresh()
+        # Refresh is a last resort and its result decides availability.
+        # Returning True unconditionally here kept handing out an account
+        # whose token was about to expire, so requests went upstream with a
+        # stale credential and came back 401/403.
+        # 記下同步刷新耗時：調度器的預刷新（wb_scheduler）正常情況下會先把
+        # 快到期的 token 刷掉，這裡只剩兜底，但一旦走到就能隨 attempts 上報
+        # 它吃掉的首字延遲。
+        t0 = time.time()
+        ok = self.refresh()
+        self.last_refresh_ms = int((time.time() - t0) * 1000)
+        return ok
 
     def headers(self, purpose="chat"):
         """組出這一輪的出站標頭。
@@ -831,6 +843,35 @@ class Account(object):
             actual_cooldown = 3 if single_account else cooldown
             self.cooldown_until = time.time() + actual_cooldown
 
+    # 429 連擊的帳號級冷卻檔位。第 1 次 429 仍只冷卻該模型（原行為）；
+    # 連續第 2 次說明整條配額線在收緊，冷卻整個帳號 300s，之後封頂 900s。
+    # 成功一次（clear_error）即清零，所以偶發抖動永遠走不到第二檔。
+    RATE_STREAK_COOLDOWNS = (300, 900)
+
+    def note_rate_limit(self, message, model=None, until=None, cooldown=60,
+                        single_account=False):
+        """note_error 的 429 專用版：在模型級冷卻之上維護連擊遞進。"""
+        escalated = False
+        with self._throttle_lock:
+            self.last_error = str(message)[:200]
+            if model:
+                wait = max(1.0, float(until) - time.time()) if until else (
+                    3.0 if single_account else float(cooldown))
+                self.model_cooldowns[model] = time.time() + wait
+            self.rate_streak = int(getattr(self, "rate_streak", 0) or 0) + 1
+            if not single_account and self.rate_streak >= 2:
+                idx = min(self.rate_streak - 2, len(self.RATE_STREAK_COOLDOWNS) - 1)
+                candidate = time.time() + self.RATE_STREAK_COOLDOWNS[idx]
+                if candidate > self.cooldown_until:
+                    self.cooldown_until = candidate
+                    escalated = True
+        # 只有真正升檔才寫盤（低頻）；失敗也不能影響請求路徑。
+        if escalated and self.path and os.path.exists(os.path.dirname(self.path)):
+            try:
+                self.save(os.path.dirname(self.path))
+            except Exception:
+                pass
+
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
         if not self.enabled or not self.access_token:
@@ -851,6 +892,15 @@ class Account(object):
             if self.last_error or self.cooldown_until:
                 self.last_error = ""
                 self.cooldown_until = 0
+            dirty = bool(getattr(self, "rate_streak", 0))
+            self.rate_streak = 0
+        if dirty and self.path and os.path.exists(os.path.dirname(self.path)):
+            # 連擊清零只有在檔案裡真的記著舊值時才需要寫回，正常成功路徑
+            # （streak 已是 0）不產生磁盤寫。
+            try:
+                self.save(os.path.dirname(self.path))
+            except Exception:
+                pass
 
 def _human_delta(seconds):
     if seconds is None: return None
@@ -1163,7 +1213,8 @@ class AccountPool(object):
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot if a.enabled and a.access_token and a.ready(model=model))
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
+                         exclude_slots=None):
         exclude = exclude or set()
         if session_key:
             bound_uid = self.affinity.get(session_key)
@@ -1172,18 +1223,38 @@ class AccountPool(object):
                 if account and account.realm == realm and account.ready(model=model):
                     return account
                 self.affinity.unbind(session_key)
-        account = self.pick(realm=realm, exclude=exclude, model=model)
+        account = self.pick(realm=realm, exclude=exclude, model=model,
+                            exclude_slots=exclude_slots)
         if account and session_key:
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def pick(self, realm=None, exclude=None, model=None, exclude_slots=None):
         exclude = exclude or set()
+        exclude_slots = exclude_slots or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
             start = self._cursor
         total = len(snapshot)
         if total == 0: return None
+
+        def slot_blocked(account):
+            if account.proxy_slot:
+                return account.proxy_slot in exclude_slots
+            return "direct" in exclude_slots
+
+        for offset in range(total):
+            index = (start + offset) % total
+            account = snapshot[index]
+            if account.uid in exclude: continue
+            if slot_blocked(account): continue
+            if account.ready(model=model):
+                with self._lock: self._cursor = (index + 1) % total
+                return account
+        if not exclude_slots:
+            return None
+        # 槽位排除把池子打空了：放開槽位偏好再掃一輪。槽位排除是本輪請求內的
+        # 偏好（那個出口剛剛瞬態失敗），不該讓請求因此直接拿不到帳號。
         for offset in range(total):
             index = (start + offset) % total
             account = snapshot[index]
@@ -1436,7 +1507,7 @@ EXPORT_VERSION = 1
 # Fields that describe live state rather than the credential itself. They are
 # exported for inspection but never trusted on import: a stale cooldown or a
 # disabled flag from another machine would silently cripple the target pool.
-VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin", "lastDailyChat")
+VOLATILE_FIELDS = ("cooldownUntil", "lastError", "rateStreak", "credits", "lastCheckin", "lastDailyChat")
 
 
 def account_to_export(account):

@@ -24,6 +24,7 @@ class Scheduler:
         self.enabled = True
         self._stop_event = threading.Event()
         self._thread = None
+        self._refresh_ahead_thread = None
         self.last_run_time = None
         self.next_run_time = None
         self.logs = []
@@ -53,11 +54,49 @@ class Scheduler:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        self.log("后台定时调度器已启动")
+        # Token 預刷新是獨立的高頻輕量線程：整點排程的保活一天只跑一次
+        # （22:00），一個 14:00 到期的 token 之前只能在請求路徑裡同步刷新，
+        # 30s 的刷新超時會直接計進首字延遲。
+        self._refresh_ahead_thread = threading.Thread(
+            target=self._refresh_ahead_loop, daemon=True)
+        self._refresh_ahead_thread.start()
+        self.log("後台定時調度器已啟動（含 Token 預刷新巡檢）")
 
     def stop(self):
         self._stop_event.set()
-        self.log("后台定时调度器已暂停")
+        self.log("後台定時調度器已暫停")
+
+    def _refresh_ahead_loop(self):
+        # 每分鐘掃一次，把 15 分鐘內到期的 token 在後台刷掉，讓 ready() 裡的
+        # 同步刷新退化成兜底路徑。正常請求從此不再承擔刷新的網路延遲。
+        while not self._stop_event.is_set():
+            try:
+                self._refresh_ahead_once()
+            except Exception as exc:
+                self.log(f"Token 預刷新巡檢異常: {exc}")
+            self._stop_event.wait(60)
+
+    def _refresh_ahead_once(self):
+        now = time.time()
+        due = []
+        for acc in list(getattr(self.pool, "accounts", []) or []):
+            if not acc.enabled or not acc.refresh_token:
+                continue
+            exp = acc.expires_at or 0
+            if not exp or exp - now > 900:
+                continue
+            # 失敗退避：同一帳號 5 分鐘內不重複嘗試，上游故障時不會每分鐘打一遍。
+            if now - (getattr(acc, "_refresh_ahead_at", 0) or 0) < 300:
+                continue
+            due.append(acc)
+        for acc in due:
+            acc._refresh_ahead_at = time.time()
+            uid8 = acc.uid[:8] if acc.uid else "?"
+            if acc.refresh():
+                left = int((acc.expires_at or 0) - time.time())
+                self.log(f"帳號 [{uid8}] Token 預刷新成功（到期前 {left}s）")
+            else:
+                self.log(f"! 帳號 [{uid8}] Token 預刷新失敗: {acc.last_error}")
 
     def _run_loop(self):
         # 启动后先休眠 10 秒等待主服务就绪，然后执行初次检查
@@ -187,10 +226,10 @@ class Scheduler:
     def status(self):
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到旅行 · 22:00 保活 · 01:00 夜猫)",
-            "mode_cn": "整点排程 (09:00/21:00 签到旅行 · 22:00 保活 · 01:00 夜猫)",
-            "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)",
-            "last_run_time": self.last_run_time or "尚未运行",
-            "next_run_time": self.next_run_time or "待调度",
+            "mode": "整點排程 (09:00/21:00 簽到旅行 · 22:00 保活 · 01:00 夜貓) + Token 預刷新 (每分鐘巡檢, 15分鐘內到期者後台刷新)",
+            "mode_cn": "整點排程 (09:00/21:00 簽到旅行 · 22:00 保活 · 01:00 夜貓) + Token 預刷新",
+            "mode_intl": "帳號 Token 自動保活與憑證常駐 (每日 22:00 集中巡檢 + 15 分鐘內到期預刷新)",
+            "last_run_time": self.last_run_time or "尚未運行",
+            "next_run_time": self.next_run_time or "待調度",
             "logs": self.logs[-20:],
         }

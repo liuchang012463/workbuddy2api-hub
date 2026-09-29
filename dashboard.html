@@ -2381,15 +2381,18 @@ async function refreshInner(){
     return (m && m.nickname) ? m.nickname : String(uid).slice(0,8);
   };
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table class="data-cards"><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>模式</th><th>结果</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th>积分</th></tr></thead><tbody>'
+    '<table class="data-cards"><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>出口</th><th>模式</th><th>结果</th><th>耗时</th><th>首字</th><th>上游首包</th><th>重试</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th>积分</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono" data-label="时间">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono" data-label="模型">' + esc(r.model) + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="账号" title="' + esc(r.account||'') + '">' + esc(acctName(r.account)) + '</td>'
+        + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="出口">' + esc(r.slot||'direct') + '</td>'
         + '<td data-label="模式"><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td data-label="结果">' + outcomeBadge(r) + '</td>'
         + '<td data-label="耗时">' + (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—') + '</td>'
         + '<td data-label="首字">' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
+        + '<td data-label="上游首包" title="上游第一个字节（含推理 chunk）">' + (r.ttfb_ms!=null ? fmt(r.ttfb_ms)+' ms' : '—') + '</td>'
+        + '<td data-label="重试" title="本次请求的上游尝试次数">' + (r.attempts>1 ? ('<b style="color:var(--warn,orange)">'+r.attempts+'</b>') : '·') + '</td>'
         + '<td data-label="速度">' + (r.tokens_per_sec ? r.tokens_per_sec.toFixed(1) : '—') + '</td>'
         + '<td data-label="输入">' + fmt(r.prompt_tokens) + '</td>'
         + '<td data-label="输出">' + fmt(r.completion_tokens) + '</td>'

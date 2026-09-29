@@ -412,6 +412,31 @@ def set_auto_switch_product(accounts_dir, enabled):
     return enabled
 
 
+def slot_fallback_url(accounts_dir):
+    """同帳號備選出口：瞬態失敗後換這條出口再試一次。
+
+    未寫入該鍵 = 關閉（升級前的安裝行為不變）；空字符串 = DIRECT；
+    "off" / "none" / "disabled" = 顯式關閉；其餘值 = 代理 URL。
+    返回 None 表示關閉，"" 表示直連，其他字符串按代理 URL 處理。
+    """
+    raw = load(accounts_dir).get("slot_fallback_url")
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if value.lower() in ("off", "none", "disabled"):
+        return None
+    return value
+
+
+def set_slot_fallback_url(accounts_dir, value):
+    """Persist the fallback exit. Returns the stored raw value."""
+    with _lock:
+        data = load(accounts_dir)
+        data["slot_fallback_url"] = "" if value is None else str(value).strip()
+        save(accounts_dir, data)
+        return data["slot_fallback_url"]
+
+
 def daily_chat_web(accounts_dir):
     """Whether the intl daily check-in also opens a web-channel conversation.
 
