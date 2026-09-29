@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from wb_fingerprint import derive_id, generate_request_id
+import wb_http
 import wb_identity
 import wb_settings
 import wb_webagent
@@ -115,6 +116,22 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
                 log("network retry %d/%d after %s" % (attempt, attempts, exc))
             time.sleep(backoff * attempt)
     raise last
+
+
+def post_json_via(url, data=None, headers=None, timeout=30, retries=3,
+                  backoff=1.0, log=None, proxy=""):
+    """httpx 池優先的 http_json 等價物。
+
+    refresh() 在請求路徑上（ready() 的兜底刷新），走連接池省一次 TLS 握手；
+    httpx 不可用時語義完全回落 http_json（同一套 _retryable 判定）。
+    """
+    if wb_http.available():
+        return wb_http.post_json(url, data=data, headers=headers, timeout=timeout,
+                                 retries=retries, backoff=backoff, log=log,
+                                 proxy=proxy, retryable=_retryable)
+    return http_json(url, data=data, method="POST" if data is not None else "GET",
+                     headers=headers, timeout=timeout, retries=retries,
+                     backoff=backoff, log=log, proxy=proxy)
 
 REALM_CONFIGS = {
     "intl": {
@@ -564,8 +581,8 @@ class Account(object):
         if self.enterprise_id:
             headers["X-Enterprise-Id"] = self.enterprise_id
         try:
-            payload = http_json(url, data=b"{}", method="POST", headers=headers, timeout=30,
-                                proxy=self.proxy)
+            payload = post_json_via(url, data=b"{}", headers=headers, timeout=30,
+                                    proxy=self.proxy)
         except Exception as exc:
             self._set_last_error("refresh failed: %s" % exc)
             return False

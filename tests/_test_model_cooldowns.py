@@ -22,8 +22,14 @@ os.environ["ACCOUNTS_DIR"] = _startup_dir.name
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import wb_accounts as accounts
+import wb_http
 import wb_proxy as proxy
 import wb_settings as settings
+
+# 這些用例 mock 的是 accounts.urlopen（urllib 回落路徑）；httpx 可用時
+# open_upstream 走 wb_http 分支會繞過 mock。這裡固定關閉，httpx 分支的
+# 行為由 _test_httpx_pool / _test_slot_aware_retry 覆蓋。
+wb_http.available = lambda: False
 
 
 class ModelCooldownTests(unittest.TestCase):

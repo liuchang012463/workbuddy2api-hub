@@ -68,6 +68,11 @@ class SlotAwareRetryTests(unittest.TestCase):
         patcher = mock.patch.object(proxy, "ACCOUNTS_DIR", _startup_dir.name)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 默認固定走 urllib 回落路徑（下面的用例 mock accounts.urlopen）；
+        # httpx 分支由專屬用例 patch wb_http 覆蓋。
+        wb_patcher = mock.patch.object(proxy.wb_http, "available", return_value=False)
+        wb_patcher.start()
+        self.addCleanup(wb_patcher.stop)
         settings.set_slot_fallback_url(_startup_dir.name, "off")
 
     def open_upstream(self):
@@ -176,6 +181,98 @@ class SlotAwareRetryTests(unittest.TestCase):
         self.assertEqual(calls, ["", ""])
         self.assertEqual(account.uid, "a4")
         self.assertTrue(all(a["slot"] == "direct" for a in resp.attempts))
+
+
+class FakeHttpxStream(object):
+    """wb_http.UpstreamStream 的替身：open() 後 status_code 可用。"""
+
+    def __init__(self, status=200, exc=None, body=b"{}"):
+        self.status_code = status
+        self._exc = exc
+        self._body = body
+        self.closed = False
+
+    def open(self):
+        if self._exc is not None:
+            raise self._exc
+        return self
+
+    def read_body(self, limit=None):
+        return self._body[:limit] if limit else self._body
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+    def __iter__(self):
+        return iter([b"data: {}"])
+
+
+class HttpxBranchTests(unittest.TestCase):
+    """open_upstream 的 httpx 分支：status 檢查 / 錯誤映射 / attempts 掛載。
+
+    刻意不繼承 SlotAwareRetryTests：繼承會把父類的 urllib mock 用例在
+    httpx 模式下重跑一遍，語義完全對不上。
+    """
+
+    def setUp(self):
+        self.pool = make_pool()
+        proxy.POOL = self.pool
+        self.addCleanup(setattr, proxy, "POOL", None)
+        patcher = mock.patch.object(proxy, "ACCOUNTS_DIR", _startup_dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        settings.set_slot_fallback_url(_startup_dir.name, "off")
+        self.streams = []
+        self.stream_args = []
+
+        def fake_upstream_post(proxy_url, url, content, headers):
+            self.stream_args.append(proxy_url)
+            return self.streams.pop(0)
+
+        wb_patcher = mock.patch.object(proxy.wb_http, "available", return_value=True)
+        wb_patcher.start()
+        self.addCleanup(wb_patcher.stop)
+        post_patcher = mock.patch.object(proxy.wb_http, "upstream_post",
+                                         side_effect=fake_upstream_post)
+        post_patcher.start()
+        self.addCleanup(post_patcher.stop)
+
+    def open_upstream(self):
+        return proxy.open_upstream(dict(PAYLOAD), target_realm="intl")
+
+    def test_httpx_branch_success_attaches_attempts(self):
+        self.streams = [FakeHttpxStream(status=200)]
+        resp, account = self.open_upstream()
+        self.assertEqual(account.uid, "a1")
+        self.assertEqual(len(resp.attempts), 1)
+        self.assertEqual(resp.attempts[0]["outcome"], "ok")
+        self.assertEqual(self.stream_args, ["http://172.17.0.1:17901"])
+
+    def test_httpx_branch_429_maps_to_rate_limited(self):
+        self.streams = [FakeHttpxStream(status=429)] * 4
+        with self.assertRaises(proxy.RateLimited) as ctx:
+            self.open_upstream()
+        self.assertEqual(len(ctx.exception.attempts), 4)
+        self.assertTrue(all(a["outcome"] == "rate_limited"
+                            for a in ctx.exception.attempts))
+
+    def test_httpx_branch_transient_error_retries_off_slot(self):
+        self.streams = [FakeHttpxStream(exc=ConnectionResetError("connection reset by peer")),
+                        FakeHttpxStream(status=200)]
+        resp, account = self.open_upstream()
+        self.assertEqual(account.uid, "a3")
+        self.assertEqual(len(resp.attempts), 2)
+        self.assertEqual(resp.attempts[0]["outcome"], "transient")
+        self.assertEqual(resp.attempts[1]["outcome"], "ok")
+        self.assertEqual(self.stream_args,
+                         ["http://172.17.0.1:17901", "http://172.17.0.1:17902"])
 
 
 if __name__ == "__main__":

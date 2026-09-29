@@ -49,7 +49,10 @@ def fake_http_json(url, **kwargs):
 
 
 real_http_json = wb_accounts.http_json
+real_post_json_via = wb_accounts.post_json_via
 wb_accounts.http_json = fake_http_json
+# httpx 可用時 refresh() 走 post_json_via（wb_http 連接池），同樣要記下 proxy。
+wb_accounts.post_json_via = fake_http_json
 
 try:
     acct = wb_accounts.Account(dict(DATA))
@@ -99,6 +102,7 @@ try:
     check("direct account sends proxy=''", seen and seen[0] == "", repr(seen[:1]))
 finally:
     wb_accounts.http_json = real_http_json
+    wb_accounts.post_json_via = real_post_json_via
 
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))

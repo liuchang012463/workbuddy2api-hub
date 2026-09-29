@@ -37,6 +37,7 @@ import urllib.request
 import uuid
 import wb_accounts
 import wb_catalog
+import wb_http
 import wb_settings
 import wb_webtools
 import wb_identity
@@ -3298,6 +3299,9 @@ def is_transient(exc):
     Treating that as a dead account took the only intl account offline for 60s
     and turned one hiccup into a 502 storm.
     """
+    if wb_http.is_transport_error(exc):
+        # httpx 的網路層異常族（連接/讀寫/超時/協議）整體視為瞬態。
+        return True
     t = ("%s %s" % (type(exc).__name__, exc)).lower()
     markers = (
         "ssl", "unexpected_eof", "eof occurred", "remote end closed",
@@ -3428,10 +3432,25 @@ def open_upstream(payload, session_key=None, target_realm=None):
         else:
             attempt_body = upstream_body
         attempt_data = json.dumps(attempt_body, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
-                                     headers=account.headers(purpose="chat"))
+        chat_headers = account.headers(purpose="chat")
         try:
-            resp = wb_accounts.urlopen(req, timeout=600, proxy=proxy_used)
+            if wb_http.available():
+                # httpx 池：keep-alive 復用 TCP+TLS，首字延遲不再付握手開銷。
+                # 響應頭已收齊後再交回原流程；>=400 時取錯誤體構造 HTTPError，
+                # 讓下面的原有分支零改動地處理 429/403/401/5xx。
+                stream = wb_http.upstream_post(proxy_used, chat_url, attempt_data,
+                                               chat_headers)
+                stream.open()
+                if stream.status_code >= 400:
+                    body = stream.read_body(600)
+                    stream.close()
+                    raise wb_http.http_error(chat_url, stream.status_code, body)
+                resp = stream
+            else:
+                # urllib 回落：沒有 httpx 的環境（舊鏡像/本機測試）。
+                req = urllib.request.Request(chat_url, data=attempt_data,
+                                             method="POST", headers=chat_headers)
+                resp = wb_accounts.urlopen(req, timeout=600, proxy=proxy_used)
             account.clear_error(model=model)
             reset_switch_counter(account, model)
             att["outcome"] = "ok"
