@@ -37,6 +37,7 @@ import urllib.request
 import uuid
 import wb_accounts
 import wb_catalog
+import wb_crypto
 import wb_http
 import wb_settings
 import wb_slothealth
@@ -7359,6 +7360,7 @@ def _bootstrap_runtime(args):
         log("panel      : password is still the default 'admin' - change it in the panel")
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
+    _migrate_encrypt_accounts()
     POOL.apply_proxy_slots()
     POOL.apply_reserve_credits()
     apply_daily_token_limit()
@@ -7368,6 +7370,45 @@ def _bootstrap_runtime(args):
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
     return api_key_generated
+
+
+def _migrate_encrypt_accounts():
+    """P6：賬號文件裡的明文 token 一次性重寫為密文。
+
+    Account.__init__ 讀盤時解密，所以內存裡全是明文運行時值；這裡只挑
+    磁盤上仍是明文的賬號重存一遍觸發 save() 的加密邊界。cryptography
+    不可用時 enabled() 為 False，整個函數是空轉（歷史行為）。
+    """
+    wb_crypto.configure(ACCOUNTS_DIR)
+    if not wb_crypto.enabled():
+        log("crypto     : 'cryptography' not installed - account tokens stay "
+            "plaintext on disk")
+        return
+    key_file = wb_crypto._key_file_path()
+    migrated = 0
+    for account in list(POOL.accounts):
+        path = account.path
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                stored = json.load(fh)
+        except Exception:
+            continue
+        if wb_crypto.is_encrypted(stored.get("accessToken")) and \
+                wb_crypto.is_encrypted(stored.get("refreshToken")):
+            continue
+        try:
+            account.save(os.path.dirname(path))
+            migrated += 1
+        except Exception as exc:
+            log("crypto     : failed to encrypt account %s: %s"
+                % (str(account.uid)[:8], exc))
+    if migrated:
+        log("crypto     : encrypted %d account file(s); BACK UP %s - losing "
+            "it makes every stored token undecryptable" % (migrated, key_file))
+    else:
+        log("crypto     : account tokens encrypted at rest (key: %s)" % key_file)
 
 def _report_first_run(args):
     if args.info:

@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from wb_fingerprint import derive_id, generate_request_id
+import wb_crypto
 import wb_http
 import wb_identity
 import wb_settings
@@ -215,7 +216,11 @@ class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
         self.path = path
-        token = str(data.get("accessToken") or "")
+        # 讀盤的 token 可能是 $wbEncrypted 信封（P6 靜態加密）；明文輸入
+        # （導入文檔、測試合成數據）原樣通過。後面的 uid/realm/jwt_exp 都
+        # 依賴解密後的值，所以這一步必須最先做。
+        token = str(wb_crypto.decrypt_field(data.get("accessToken")) or "")
+        refresh_token = str(wb_crypto.decrypt_field(data.get("refreshToken")) or "")
         self.uid = str(data.get("uid") or jwt_uid(token))
         # The CN desktop build stores its nickname as an encrypted envelope
         # ({"$wbEncrypted": ...}) rather than plain text. Stringifying that would
@@ -239,7 +244,7 @@ class Account(object):
         self.product = wb_identity.normalize_product(data.get("product"))
         self.enterprise_id = str(data.get("enterpriseId") or "")
         self.access_token = token
-        self.refresh_token = str(data.get("refreshToken") or "")
+        self.refresh_token = refresh_token
         self.expires_at = normalize_epoch(data.get("expiresAt")) or jwt_exp(token)
         self.added_at = data.get("addedAt") or time.time()
         self.source = str(data.get("source") or "oauth")
@@ -386,8 +391,14 @@ class Account(object):
         with self._save_lock:
             tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
             try:
+                # P6 靜態加密只在落盤邊界生效：to_dict()/導出文檔保持明文，
+                # 內存運行時值也不變。cryptography 不可用時原樣明文（歷史行為）。
+                payload = self.to_dict()
+                if wb_crypto.enabled():
+                    payload["accessToken"] = wb_crypto.encrypt_field(self.access_token)
+                    payload["refreshToken"] = wb_crypto.encrypt_field(self.refresh_token)
                 with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(self.to_dict(), fh, ensure_ascii=False, indent=2)
+                    json.dump(payload, fh, ensure_ascii=False, indent=2)
                 os.replace(tmp, path)
             except Exception:
                 try:
