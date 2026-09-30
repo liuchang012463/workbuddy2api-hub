@@ -144,5 +144,56 @@ class ExportCompatibilityTests(CryptoBase):
         self.assertEqual(imported.access_token, "t.export.here")
 
 
+@unittest.skipUnless(wb_crypto.enabled(), "cryptography not installed")
+class SecondBootTests(CryptoBase):
+    """回歸釘子：bootstrap 必須在 POOL.load() 之前 configure()，否則重啟後
+    密鑰會回退到 CWD 解析、生成一把錯鑰，整池賬號解密失敗（真實事故）。"""
+
+    def test_server_boots_with_preencrypted_store(self):
+        import socket
+        import subprocess
+        import time as _time
+        import urllib.request
+
+        account = accounts.Account({"uid": "boot-me", "realm": "cn",
+                                    "accessToken": "t.boot.because", "refreshToken": "r"})
+        account.save(_startup_dir.name)
+
+        def free_port():
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            return port
+
+        port = free_port()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(root, "wb_proxy.py"), "--port", str(port),
+             "--host", "127.0.0.1", "--accounts-dir", _startup_dir.name],
+            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        try:
+            ready = None
+            for _ in range(40):
+                _time.sleep(0.5)
+                try:
+                    with urllib.request.urlopen(
+                            "http://127.0.0.1:%d/health" % port, timeout=2) as resp:
+                        ready = json.loads(resp.read().decode("utf-8"))
+                        break
+                except Exception:
+                    if proc.poll() is not None:
+                        break
+            self.assertIsNotNone(ready, "server did not start")
+            self.assertGreaterEqual(ready.get("accounts_ready", 0), 1,
+                                    "重启后加密账号必须能解密加载: %s" % ready)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7340,6 +7340,10 @@ def _bootstrap_runtime(args):
     SYSTEM_PROMPT = args.system_prompt
     if args.accounts_dir:
         ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
+    # 必須在任何賬號文件被讀取之前就位：Account.__init__ 讀盤即解密，
+    # 密鑰文件默認放在 <ACCOUNTS_DIR>/encryption.key，晚了會回退到 CWD
+    # 解析出一把錯誤的新鑰匙，整池賬號解密失敗。
+    wb_crypto.configure(ACCOUNTS_DIR)
     # LAN mode must not ship a known key: the gateway spends the account's own
     # upstream quota, so a guessable default lets anyone on the network drain
     # it. Generate one on first use, persist it, and reuse it afterwards.
@@ -7379,7 +7383,6 @@ def _migrate_encrypt_accounts():
     磁盤上仍是明文的賬號重存一遍觸發 save() 的加密邊界。cryptography
     不可用時 enabled() 為 False，整個函數是空轉（歷史行為）。
     """
-    wb_crypto.configure(ACCOUNTS_DIR)
     if not wb_crypto.enabled():
         log("crypto     : 'cryptography' not installed - account tokens stay "
             "plaintext on disk")
